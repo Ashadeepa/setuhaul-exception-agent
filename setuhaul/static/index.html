@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SetuHaul · Driver exceptions</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #e4e2dd;
+    --accent: #c2410c; --free: #e8f3ea; --free-b: #8cc49a; --booked: #d9e2f1; --booked-b: #6f8fc4;
+    --held: #fdf0c8; --held-b: #d6a419; --blocked: #ececec; --blocked-b: #b3b3b3;
+    --event: #f8dcdc; --event-b: #d07070; --overrun: #f3e1f4; --overrun-b: #a565ac;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; color: var(--ink); background: var(--bg); }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+  header .clock { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 18px; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); padding: 6px 10px; border-radius: 8px; cursor: pointer; }
+  button:hover { border-color: #c9c6bf; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  main { display: grid; grid-template-columns: minmax(360px, 440px) 1fr; gap: 16px; padding: 16px 20px; }
+  section.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  section.card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  .chat { display: flex; flex-direction: column; height: calc(100vh - 100px); }
+  .chat .controls { display: flex; gap: 8px; margin-bottom: 10px; }
+  .chat select { flex: 1; font: inherit; padding: 6px; border-radius: 8px; border: 1px solid var(--line); }
+  .ships { font-size: 12px; color: var(--muted); margin-bottom: 8px; min-height: 18px; }
+  .msgs { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 6px 2px; }
+  .bubble { max-width: 86%; padding: 8px 11px; border-radius: 12px; white-space: pre-wrap; }
+  .bubble.driver { align-self: flex-end; background: #dcf2df; border-bottom-right-radius: 3px; }
+  .bubble.agent { align-self: flex-start; background: #f1f0ec; border-bottom-left-radius: 3px; }
+  .bubble.dup { opacity: .55; font-style: italic; }
+  .trace { align-self: flex-start; font-size: 11.5px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; border-left: 2px solid var(--line); padding-left: 8px; }
+  .trace .bad { color: #b42318; }
+  .compose { display: flex; gap: 8px; margin-top: 10px; }
+  .compose textarea { flex: 1; font: inherit; resize: none; height: 54px; padding: 8px; border-radius: 8px; border: 1px solid var(--line); }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .samples { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .samples button { font-size: 12px; padding: 3px 8px; }
+  .right { display: grid; gap: 16px; align-content: start; }
+  .board { position: relative; }
+  .axis, .row { display: grid; grid-template-columns: 72px 1fr; align-items: center; }
+  .axis .ticks, .row .lane { position: relative; height: 30px; }
+  .axis .ticks span { position: absolute; font-size: 11px; color: var(--muted); transform: translateX(-50%); top: 6px; }
+  .row .lab { font-size: 12px; font-weight: 600; }
+  .row .lab small { display: block; font-weight: 400; color: var(--muted); font-size: 10.5px; }
+  .row { border-top: 1px solid var(--line); }
+  .slot { position: absolute; top: 4px; bottom: 4px; border-radius: 5px; border: 1px solid; font-size: 10.5px; overflow: hidden; padding: 1px 4px; white-space: nowrap; }
+  .slot.FREE { background: var(--free); border-color: var(--free-b); }
+  .slot.BOOKED { background: var(--booked); border-color: var(--booked-b); }
+  .slot.HELD { background: var(--held); border-color: var(--held-b); }
+  .slot.BLOCKED, .slot.CLOSED { background: var(--blocked); border-color: var(--blocked-b); }
+  .slot.DOCK_EVENT { background: var(--event); border-color: var(--event-b); }
+  .slot.OCCUPIED_OVERRUN { background: var(--overrun); border-color: var(--overrun-b); }
+  .slot.past { opacity: .35; }
+  .nowline { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent); z-index: 2; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 11.5px; color: var(--muted); margin-top: 10px; }
+  .legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; border: 1px solid; vertical-align: -2px; margin-right: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 11.5px; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 99px; font-size: 11px; font-weight: 600; }
+  .pill.QUEUED { background: #fdf0c8; } .pill.FAILED { background: #f8dcdc; } .pill.ACKNOWLEDGED { background: #e8f3ea; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .race-out { font-size: 12.5px; margin-top: 8px; }
+  .ok { color: #1a7f37; font-weight: 600; } .err { color: #b42318; font-weight: 600; }
+  .log { max-height: 260px; overflow-y: auto; }
+  .banner { background: #fff4e5; border: 1px solid #f5c37a; padding: 8px 12px; border-radius: 8px; font-size: 12.5px; margin-bottom: 10px; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SetuHaul · Driver exceptions</h1>
+  <span class="clock" id="clock">--:--</span>
+  <span class="meta">4 Aug 2026 · simulated clock</span>
+  <button onclick="moveClock(5)">+5 min</button>
+  <button onclick="moveClock(15)">+15 min</button>
+  <span class="spacer"></span>
+  <span class="meta" id="cfg"></span>
+  <button onclick="resetAll()">Reset data</button>
+</header>
+
+<main>
+  <section class="card chat">
+    <h2>Driver chat</h2>
+    <div class="banner" id="banner"></div>
+    <div class="controls">
+      <select id="driver"></select>
+      <button class="primary" onclick="newThread()">New conversation</button>
+    </div>
+    <div class="ships" id="ships"></div>
+    <div class="msgs" id="msgs"></div>
+    <div class="compose">
+      <textarea id="text" placeholder="Type as the driver…" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send();}"></textarea>
+      <button class="primary" onclick="send()">Send</button>
+    </div>
+    <div class="samples" id="samples"></div>
+    <div class="hint">Tool calls appear in grey under each reply, so you can see what code decided.</div>
+  </section>
+
+  <div class="right">
+    <section class="card">
+      <h2>Jaipur DC · dock board</h2>
+      <div class="board" id="board"></div>
+      <div class="legend">
+        <span><i style="background:var(--free);border-color:var(--free-b)"></i>Free</span>
+        <span><i style="background:var(--booked);border-color:var(--booked-b)"></i>Booked</span>
+        <span><i style="background:var(--held);border-color:var(--held-b)"></i>Held (5 min)</span>
+        <span><i style="background:var(--event);border-color:var(--event-b)"></i>Breakdown / maintenance</span>
+        <span><i style="background:var(--overrun);border-color:var(--overrun-b)"></i>Truck still unloading</span>
+        <span><i style="background:var(--blocked);border-color:var(--blocked-b)"></i>Blocked</span>
+      </div>
+    </section>
+
+    <div class="grid2">
+      <section class="card">
+        <h2>Escalations</h2>
+        <div id="escs"></div>
+      </section>
+      <section class="card">
+        <h2>Integrity check: many drivers, one slot</h2>
+        <div>Every truck that could use the slot tries to hold and confirm it at the same instant. The winner is really rebooked; use Reset data to start over.</div>
+        <div style="margin-top:8px;display:flex;gap:8px">
+          <select id="raceSlot"></select>
+          <button class="primary" onclick="race()">Run race</button>
+        </div>
+        <div class="race-out" id="raceOut"></div>
+        <h2 style="margin-top:14px">Active holds</h2>
+        <div id="holds"></div>
+      </section>
+    </div>
+
+    <section class="card">
+      <h2>Decision log</h2>
+      <div class="log" id="log"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const SAMPLES = {
+  DRV006: ["Traffic after Shahpura. Reaching around 11:20. Any slot after 12?"],
+  DRV012: ["Tyre repaired. I can reach 11:10. I need to leave the warehouse before 1:30 for another pickup."],
+  DRV013: ["I am late by one hour."],
+  DRV014: ["Origin released me late. ETA 11:25. This load is urgent. Can I get the first possible dock?"],
+  DRV015: ["Evening traffic. ETA 6:30. Can the reefer unload tonight?"],
+  DRV007: ["Heavy trailer ETA 12:00. Original heavy-bay slot will be missed. What is next?"],
+  DRV003: ["I am already at the gate. Can I get a dock now instead of waiting?"],
+  DRV004: ["I will be late by 45 minutes."],
+  DRV001: ["What slots are possible after 1 PM if I reach around 12:45?"],
+  DRV008: ["Is my 4 PM slot still active?"],
+};
+let thread = null;
+const $ = id => document.getElementById(id);
+const api = async (path, opts={}) => {
+  const r = await fetch(path, {headers: {"Content-Type": "application/json"}, ...opts});
+  if (!r.ok) { const t = await r.json().catch(() => ({detail: r.statusText})); throw new Error(t.detail || r.statusText); }
+  return r.json();
+};
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function loadDrivers() {
+  const d = await api("/api/drivers");
+  $("driver").innerHTML = d.drivers.map(x => `<option value="${x.driver_id}">${x.driver_id} · ${esc(x.name)}</option>`).join("");
+  window._drivers = Object.fromEntries(d.drivers.map(x => [x.driver_id, x]));
+  $("driver").value = "DRV006";
+  driverChanged();
+}
+function driverChanged() {
+  const d = window._drivers[$("driver").value];
+  $("ships").textContent = d.shipments.map(s => `${s.shipment_id} (${s.current_status.toLowerCase()}, ${s.destination_facility_id})`).join(" · ");
+  $("samples").innerHTML = (SAMPLES[d.driver_id] || []).map(t => `<button onclick='useSample(${JSON.stringify(t)})'>${esc(t)}</button>`).join("");
+  thread = null; $("msgs").innerHTML = "";
+}
+function useSample(t) { $("text").value = t; $("text").focus(); }
+async function newThread() {
+  const r = await api("/api/threads", {method: "POST", body: JSON.stringify({driver_id: $("driver").value})});
+  thread = r.thread_id; $("msgs").innerHTML = "";
+  addSys(`New conversation ${thread}`);
+}
+function addBubble(cls, text) { const b = document.createElement("div"); b.className = "bubble " + cls; b.textContent = text; $("msgs").appendChild(b); $("msgs").scrollTop = 1e9; }
+function addSys(text) { const t = document.createElement("div"); t.className = "trace"; t.textContent = text; $("msgs").appendChild(t); }
+function addTrace(calls) {
+  if (!calls?.length) return;
+  const t = document.createElement("div"); t.className = "trace";
+  t.innerHTML = calls.map(c => {
+    const r = c.result || {}; const brief = r.status || r.code || (r.ok === false ? "refused" : r.hold_id || r.appointment_id || r.escalation_id || "ok");
+    const args = Object.entries(c.input || {}).map(([k,v]) => `${k}=${v}`).join(", ");
+    return `<div class="${c.ok && r.ok !== false ? "" : "bad"}">→ ${esc(c.tool)}(${esc(args)}) · ${esc(brief)}</div>`;
+  }).join("");
+  $("msgs").appendChild(t);
+}
+async function send() {
+  const text = $("text").value.trim(); if (!text) return;
+  if (!thread) await newThread();
+  $("text").value = ""; addBubble("driver", text);
+  try {
+    const r = await api(`/api/threads/${thread}/messages`, {method: "POST", body: JSON.stringify({text})});
+    addTrace(r.tool_calls); addBubble("agent" + (r.duplicate ? " dup" : ""), (r.duplicate ? "(duplicate ignored) " : "") + r.reply);
+  } catch (e) { banner(e.message); }
+  refresh();
+}
+function banner(msg) { $("banner").style.display = msg ? "block" : "none"; $("banner").textContent = msg || ""; }
+
+function toMin(hhmm) { const [h,m] = hhmm.split(":").map(Number); return h*60+m; }
+async function refresh() {
+  const [st, b] = await Promise.all([api("/api/ops/state"), api("/api/ops/board")]);
+  $("clock").textContent = st.now_hhmm;
+  $("cfg").textContent = `model: ${st.model || "not set"} · memory: ${st.memory}`;
+  if (!st.model) banner("BEDROCK_MODEL_ID is not set, so chat replies will fail. The board, race and escalations still work. See README.");
+  drawBoard(b, st.now_hhmm);
+  $("holds").innerHTML = st.holds.length ? `<table><tr><th>Shipment</th><th>Slots</th><th>Expires</th></tr>${st.holds.map(h => `<tr><td>${h.shipment_id}</td><td>${esc(h.slot_ids)}</td><td>${h.expires_hhmm}</td></tr>`).join("")}</table>` : `<div class="hint">No active holds.</div>`;
+  $("escs").innerHTML = st.escalations.length ? `<table><tr><th>Case</th><th>To</th><th>Status</th><th></th></tr>${st.escalations.map(e => `<tr><td><b>${e.shipment_id || e.driver_id}</b> · ${esc(e.reason_code)}<br><span class="hint">${esc(e.summary)}</span></td><td>${esc(e.assigned_to || "nobody reachable")}</td><td><span class="pill ${e.delivery_status}">${e.delivery_status}</span></td><td>${e.delivery_status === "QUEUED" ? `<button onclick="ack('${e.escalation_id}')">Acknowledge</button>` : ""}</td></tr>`).join("")}</table>` : `<div class="hint">None yet.</div>`;
+  $("log").innerHTML = `<table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Shipment</th><th>Outcome</th></tr>${st.decision_log.map(l => `<tr><td>${l.sim_time.slice(11,16)}</td><td>${esc(l.actor)}</td><td>${esc(l.action)}</td><td>${esc(l.shipment_id || "")}</td><td>${esc(l.outcome)}</td></tr>`).join("")}</table>`;
+}
+function drawBoard(b, nowHHMM) {
+  const start = 8*60, end = 22*60, span = end - start;
+  const pct = m => ((m - start) / span * 100).toFixed(3) + "%";
+  const docks = {}; b.slots.forEach(s => (docks[s.dock] ||= {type: s.dock_type, slots: []}).slots.push(s));
+  let html = `<div class="axis"><div></div><div class="ticks">${Array.from({length: 15}, (_, i) => `<span style="left:${pct(start + i*60)}">${String(8+i).padStart(2,"0")}</span>`).join("")}</div></div>`;
+  for (const [code, d] of Object.entries(docks)) {
+    html += `<div class="row"><div class="lab">${code}<small>${d.type.toLowerCase()}</small></div><div class="lane">`;
+    for (const s of d.slots) {
+      const l = toMin(s.start), r = toMin(s.end);
+      html += `<div class="slot ${s.state} ${s.past ? "past" : ""}" style="left:${pct(l)};width:calc(${pct(r)} - ${pct(l)} - 2px)" title="${s.slot_id} ${s.start}-${s.end} ${s.state} ${s.shipment_id || ""}">${s.shipment_id ? s.shipment_id.replace("SHP","") : ""}</div>`;
+    }
+    html += `</div></div>`;
+  }
+  $("board").innerHTML = html;
+  const lanes = document.querySelectorAll("#board .lane");
+  lanes.forEach(l => { const n = document.createElement("div"); n.className = "nowline"; n.style.left = pct(toMin(nowHHMM)); l.appendChild(n); });
+  const free = b.slots.filter(s => s.state === "FREE" && !s.past);
+  const cur = $("raceSlot").value;
+  $("raceSlot").innerHTML = free.map(s => `<option value="${s.slot_id}">${s.dock} ${s.start}</option>`).join("");
+  if (cur && free.some(s => s.slot_id === cur)) $("raceSlot").value = cur;
+}
+async function moveClock(m) { await api("/api/ops/clock", {method: "POST", body: JSON.stringify({advance_min: m})}); refresh(); }
+async function resetAll() { if (!confirm("Reset all data to the snapshot?")) return; await api("/api/ops/reset", {method: "POST"}); thread = null; $("msgs").innerHTML = ""; $("raceOut").innerHTML = ""; refresh(); }
+async function ack(id) { await api(`/api/ops/escalations/${id}/ack`, {method: "POST", body: JSON.stringify({note: "Taken by operations"})}); refresh(); }
+async function race() {
+  const label = $("raceSlot").selectedOptions[0]?.textContent || $("raceSlot").value;
+  const r = await api("/api/ops/race", {method: "POST", body: JSON.stringify({slot_id: $("raceSlot").value})});
+  const verdict = r.double_booked ? `<span class="err">DOUBLE BOOKED</span>` : `<span class="ok">No double booking</span>`;
+  $("raceOut").innerHTML = `<b>${esc(label)}</b> · ${verdict}: ${r.contenders.length} trucks competed, ${r.winners.length} won (${r.winners.join(", ") || "none"}). Claims on slot: ${r.claims_on_slot}; active bookings: ${r.active_appointments_on_slot}.<br><span class="hint">Refused: ${Object.entries(r.losers).map(([s,c]) => `${s} ${c}`).join(" · ")}</span>`;
+  refresh();
+}
+$("driver").addEventListener("change", driverChanged);
+loadDrivers().then(refresh);
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
