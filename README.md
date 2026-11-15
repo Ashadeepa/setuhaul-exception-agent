@@ -17,6 +17,7 @@ slots is a tool result.
 flowchart LR
     D[Driver chat] --> A[Agent<br/>Bedrock Converse + tools]
     A <--> M[(Memory<br/>SQLite or Upstash)]
+    A <--> G{{Guardrails<br/>input, tool gates, output}}
     A -->|tool calls| T[Tools<br/>scoped to this driver]
     T --> C[Capacity layer<br/>feasibility, holds, bookings]
     C --> DB[(SQLite<br/>system of record)]
@@ -92,7 +93,7 @@ live only in the database.
 pytest -q
 ```
 
-57 tests, no AWS needed (a scripted model stands in for Bedrock):
+98 tests, no AWS needed (a scripted model stands in for Bedrock):
 
 - `tests/test_integrity.py` (**deliverable 5**). Seven trucks hold and confirm the same slot at the
   same instant, each on its own connection, released by a barrier. Run 20 times: every round has
@@ -102,8 +103,60 @@ pytest -q
 - `tests/test_capacity.py`: each feasibility rule, tied to the data-audit finding it fixes.
 - `tests/test_agent.py`: tool scoping, duplicate messages, a model outage, constraint memory,
   escalation routing, and the Upstash client.
+- `tests/test_guardrails.py`: each input, tool and output guardrail, alone and inside the agent loop.
+- `tests/test_evals.py`: the eval harness and its graders.
 
 The ops panel's **Run race** button runs the same race live against the current data.
+
+## Guardrails
+
+The model can be confidently wrong. Code checks it at three points, so a wrong answer is never sent to
+a driver or written to the database (`setuhaul/guardrails.py`).
+
+| Checkpoint | Rule | If it fails |
+| --- | --- | --- |
+| Input | Safety words (accident, hurt, brakes failed, fire…) | Code escalates to the shift manager as `DRIVER_SAFETY` and replies with the 112 emergency line. The model is not asked. |
+| Input | Instruction injection or claimed authority ("ignore previous instructions", "this is the ops manager") | The message is passed to the model framed as driver text only. Permissions never change. |
+| Input | Over 800 characters | Cut to 800 and flagged |
+| Tool gate | `hold_slot` only for a slot code a search returned in this conversation | Refused with `SLOT_NOT_OFFERED`. The model must search first. |
+| Tool gate | `confirm_booking` only for a hold made in an earlier turn, and only after a clear yes ("yes", "ok", "haan", "book it"…) | Refused with `CONFIRM_SAME_TURN` or `NO_CLEAR_YES` |
+| Output | Every dock and time in the reply was returned by a tool in this conversation | Reply blocked |
+| Output | "Booked"/"confirmed" only after a successful `confirm_booking`; "I've notified operations" only after a successful escalation | Reply blocked |
+| Output | No internal IDs (slot, hold, appointment codes) | Reply blocked |
+
+A blocked reply is not sent. The model gets one repair attempt with the reasons. If the repair also
+fails, the driver gets a template reply built only from tool results. Every guardrail event is written
+to the decision log and shown in grey under the reply in the chat.
+
+## Evals
+
+`evals/` scores the agent end to end against Bedrock. It has 17 cases: the brief's ladder of
+situations (levels 1 to 6) plus 5 adversarial ones (injection, impersonation, no consent, safety,
+data fishing).
+
+```bash
+python -m evals.run                         # all cases
+python -m evals.run --cases L4-rebook,L5-slot-taken
+python -m evals.run --repeat 3              # each case 3 times, to expose flaky behaviour
+python -m evals.run --judge                 # add a model-judged score for tone and clarity
+```
+
+- **Every case starts on a fresh copy** of the snapshot at its own time (10:15, or 16:30 for the reefer case).
+- **Cases can change the world mid-conversation.** A step can move the clock forward (hold expiry) or
+  have another truck take the slot the driver was just offered.
+- **Graders are deterministic.** They read the database and the replies, never the model's account of
+  what it did. Examples: booked on a heavy dock and ending by 13:30; the old booking cancelled and
+  linked; other drivers' bookings untouched; no booking claim without a booking. The integrity check
+  runs on every case.
+- **The judge is advisory.** `--judge` scores grounding, clarity, asking only what is needed, honesty
+  and fit to the case rubric (1 to 5). Pass or fail never depends on it.
+- **The report** (`evals/results/<time>/report.md` and `results.json`) maps to the brief's rubric:
+  conflicting allocations, options found infeasible at hold time, replies blocked, repaired or replaced,
+  gate refusals, clarification turns, model time and tokens. Full transcripts with tool calls are
+  included, ready for the scenario-run deliverable.
+
+The harness is itself tested (`tests/test_evals.py`) with scripted agents. A good script must pass, and a
+bad one (a guessed ETA recorded as certain, no question asked) must be caught by exactly the right graders.
 
 ## What changed from the seed data, and why
 
@@ -142,6 +195,7 @@ The working database is rebuilt from `data/seed.db` on start (`SETUHAUL_RESET_ON
 setuhaul/
   capacity.py    feasibility, holds, bookings (the decisions)
   tools.py       the 9 tools the agent can call, with Bedrock schemas
+  guardrails.py  input screening, tool gates, output validation
   agent.py       Converse tool-use loop, dedupe, memory, thread handling
   llm.py         Bedrock client; ScriptedModel for tests
   memory.py      SQLite and Upstash memory stores
@@ -150,6 +204,7 @@ setuhaul/
   clock.py       simulated clock
   api.py         FastAPI app
   static/        one-page chat and ops panel
+evals/           eval cases, graders, runner, optional judge
 data/seed.db     the snapshot from the data package
 docs/            data audit queries, constraint probe, database guide
 tests/

@@ -199,7 +199,9 @@ async function send() {
   $("text").value = ""; addBubble("driver", text);
   try {
     const r = await api(`/api/threads/${thread}/messages`, {method: "POST", body: JSON.stringify({text})});
-    addTrace(r.tool_calls); addBubble("agent" + (r.duplicate ? " dup" : ""), (r.duplicate ? "(duplicate ignored) " : "") + r.reply);
+    addTrace(r.tool_calls);
+    if (r.guardrails?.length) { const g = document.createElement("div"); g.className = "trace"; g.innerHTML = r.guardrails.map(e => `<div class="bad">guardrail · ${esc(e.stage)} · ${esc(e.code)}${e.problems ? ": " + esc(e.problems.join("; ")) : ""}</div>`).join(""); $("msgs").appendChild(g); }
+    addBubble("agent" + (r.duplicate ? " dup" : ""), (r.duplicate ? "(duplicate ignored) " : "") + r.reply);
   } catch (e) { banner(e.message); }
   refresh();
 }

@@ -31,15 +31,13 @@ class BedrockModel:
         import boto3
         self._client = boto3.client("bedrock-runtime", region_name=self.region)
 
-    def converse(self, *, system: str, messages: list, tool_config: dict) -> dict:
+    def converse(self, *, system: str, messages: list, tool_config: dict | None) -> dict:
+        kwargs = {"modelId": self.model_id, "system": [{"text": system}], "messages": messages,
+                  "inferenceConfig": {"maxTokens": 1024, "temperature": 0.2}}
+        if tool_config:
+            kwargs["toolConfig"] = tool_config
         try:
-            return self._client.converse(
-                modelId=self.model_id,
-                system=[{"text": system}],
-                messages=messages,
-                toolConfig=tool_config,
-                inferenceConfig={"maxTokens": 1024, "temperature": 0.2},
-            )
+            return self._client.converse(**kwargs)
         except Exception as e:  # botocore errors: credentials, access denied, throttling
             raise ModelUnavailable(f"Bedrock call failed: {e}") from e
 
@@ -52,7 +50,8 @@ class ScriptedModel:
         self.calls: list[list] = []
 
     def converse(self, *, system: str, messages: list, tool_config: dict) -> dict:
-        self.calls.append(messages)
+        import copy
+        self.calls.append(copy.deepcopy(messages))
         kind, *rest = self.steps.pop(0)
         if kind == "tool":
             name, args = rest
@@ -75,3 +74,25 @@ def get_model() -> Model:
 def set_model(model: Model | None) -> None:
     global _model
     _model = model
+
+
+class CountingModel:
+    """Wraps a model and adds up calls, tokens and latency, for evals."""
+
+    def __init__(self, inner: Model):
+        self.inner = inner
+        self.calls = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.seconds = 0.0
+
+    def converse(self, **kw) -> dict:
+        import time
+        t = time.time()
+        resp = self.inner.converse(**kw)
+        self.seconds += time.time() - t
+        self.calls += 1
+        usage = resp.get("usage") or {}
+        self.input_tokens += usage.get("inputTokens", 0)
+        self.output_tokens += usage.get("outputTokens", 0)
+        return resp

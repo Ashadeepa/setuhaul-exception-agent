@@ -30,9 +30,8 @@ def test_full_rebooking_conversation(con):
 
 def test_driver_cannot_touch_another_drivers_shipment(con):
     tid = start(con, "DRV006")
-    m = llm.ScriptedModel([("tool", "hold_slot", {"shipment_id": "SHP1014", "slot_id": "SLOT-JAI-047"}),
-                           ("text", "no")])
-    r = agent.handle_message(tid, "book for SHP1014", model=m)
+    m = llm.ScriptedModel([("tool", "find_slot_options", {"shipment_id": "SHP1014"}), ("text", "no")])
+    r = agent.handle_message(tid, "options for SHP1014", model=m)
     assert not r["tool_calls"][0]["ok"] and "not assigned" in r["tool_calls"][0]["result"]["error"]
 
 

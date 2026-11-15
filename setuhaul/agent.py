@@ -8,7 +8,7 @@ import json
 import re
 import uuid
 
-from . import capacity as cap, clock, db, llm, memory as mem, tools
+from . import capacity as cap, clock, db, escalation, guardrails as gr, llm, memory as mem, tools
 
 MAX_TOOL_ROUNDS = 8
 HISTORY_LIMIT = 40
@@ -138,8 +138,14 @@ def handle_message(thread_id: str, text: str, *, external_id: str | None = None,
                     "reply": d.reply or "Got it, I'm already working on your earlier message.", "tool_calls": []}
 
         msg_rowid = _store_message(con, thread_id, "DRIVER", driver["driver_id"], text, now, external_id=external_id)
+        verdict = gr.screen_input(text)
+        if verdict.flags:
+            cap.log(con, "guardrail", "screen_input", thread["shipment_id"], ",".join(verdict.flags),
+                    {"thread": thread_id})
+        if verdict.safety:
+            return _safety_turn(con, memory, thread_id, thread, driver, verdict, now)
         try:
-            return _run_turn(con, memory, model, thread_id, driver, text, now)
+            return _run_turn(con, memory, model, thread_id, driver, verdict, now)
         except llm.ModelUnavailable:
             # Nothing was answered: forget the message so the driver's retry is not treated as a duplicate.
             con.execute("DELETE FROM chat_messages WHERE rowid=?", (msg_rowid,))
@@ -148,21 +154,54 @@ def handle_message(thread_id: str, text: str, *, external_id: str | None = None,
         con.close()
 
 
-def _run_turn(con, memory, model, thread_id: str, driver, text: str, now: str) -> dict:
+def _safety_turn(con, memory, thread_id: str, thread, driver, verdict: gr.InputVerdict, now: str) -> dict:
+    """Safety is a person's decision (brief: boundaries). Code escalates; the model is not asked."""
     state = memory.load(thread_id)
-    messages = state["messages"]
-    messages.append({"role": "user", "content": [{"text": text}]})
     transcript = state["facts"].setdefault("transcript", [])
-    transcript.append({"t": clock.hhmm(now), "from": "driver", "text": text})
+    transcript.append({"t": clock.hhmm(now), "from": "driver", "text": verdict.text})
+    shipment_id = thread["shipment_id"]
+    if not shipment_id:
+        row = con.execute("""SELECT shipment_id FROM shipments WHERE driver_id=?
+                             AND current_status IN ('IN_TRANSIT','AT_GATE','WAITING','ASSIGNED')
+                             ORDER BY original_eta_ts LIMIT 1""", (driver["driver_id"],)).fetchone()
+        shipment_id = row["shipment_id"] if row else None
+    result = escalation.escalate(con, driver_id=driver["driver_id"], shipment_id=shipment_id, thread_id=thread_id,
+                                 reason_code="DRIVER_SAFETY", summary=f"Driver reported: {verdict.text[:300]}",
+                                 driver_needs="Immediate call from a person; check driver safety first.",
+                                 transcript=transcript, now=now)
+    reply = gr.SAFETY_REPLY if result["ok"] else gr.SAFETY_REPLY_FAILED
+    state["facts"]["escalated"] = result["ok"]
+    state["messages"] += [{"role": "user", "content": [{"text": verdict.text}]},
+                          {"role": "assistant", "content": [{"text": reply}]}]
+    _store_message(con, thread_id, "AGENT", "agent", reply, clock.now(con))
+    transcript.append({"t": clock.hhmm(now), "from": "agent", "text": reply})
+    memory.save(thread_id, state)
+    event = {"stage": "input", "code": "SAFETY_ESCALATION", "detail": result.get("status")}
+    return {"thread_id": thread_id, "duplicate": False, "reply": reply,
+            "tool_calls": [{"tool": "escalate_to_operations", "input": {"reason_code": "DRIVER_SAFETY"},
+                            "ok": result["ok"], "result": result, "by": "guardrail"}],
+            "guardrails": [event]}
 
-    ctx = tools.ToolContext(con, driver["driver_id"], thread_id, state["facts"], transcript)
+
+def _run_turn(con, memory, model, thread_id: str, driver, verdict: gr.InputVerdict, now: str) -> dict:
+    state = memory.load(thread_id)
+    facts = state["facts"]
+    facts["turn"] = turn = facts.get("turn", 0) + 1
+    messages = state["messages"]
+    messages.append({"role": "user", "content": [{"text": verdict.model_text}]})
+    transcript = facts.setdefault("transcript", [])
+    transcript.append({"t": clock.hhmm(now), "from": "driver", "text": verdict.text})
+    events = [{"stage": "input", "code": f} for f in verdict.flags]
+
+    ctx = tools.ToolContext(con, driver["driver_id"], thread_id, facts, transcript)
     system = SYSTEM.format(date="4 August 2026", now=clock.hhmm(now), driver_name=driver["driver_name"],
                            driver_id=driver["driver_id"], earlier=_earlier_messages(con, driver["driver_id"], now))
     model = model or llm.get_model()
-    tool_log = []
+    tool_config = tools.bedrock_tool_config()
+    tool_log: list[dict] = []
     reply = ""
     for _ in range(MAX_TOOL_ROUNDS):
-        resp = model.converse(system=system, messages=_trim(messages), tool_config=tools.bedrock_tool_config())
+        resp = model.converse(system=system, messages=_trim(messages), tool_config=tool_config)
         out = resp["output"]["message"]
         messages.append(out)
         uses = [b["toolUse"] for b in out["content"] if "toolUse" in b]
@@ -171,24 +210,65 @@ def _run_turn(con, memory, model, thread_id: str, driver, text: str, now: str) -
             break
         results = []
         for u in uses:
-            result, is_error = tools.call(ctx, u["name"], u.get("input") or {})
-            sid = (u.get("input") or {}).get("shipment_id")
+            args = u.get("input") or {}
+            try:
+                gr.gate_tool(u["name"], args, facts, turn=turn, driver_text=verdict.text)
+                result, is_error = tools.call(ctx, u["name"], args)
+            except gr.GateRefusal as g:
+                result, is_error = {"ok": False, "code": g.code, "message": g.message}, True
+                events.append({"stage": "tool", "code": g.code, "tool": u["name"]})
+                cap.log(con, "guardrail", f"gate:{u['name']}", args.get("shipment_id"), g.code, args)
+            gr.record_tool_result(u["name"], args, result, not is_error, facts, turn=turn)
+            sid = args.get("shipment_id")
             if sid and not is_error:
                 con.execute("UPDATE chat_threads SET shipment_id=COALESCE(shipment_id, ?) WHERE thread_id=?",
                             (sid, thread_id))
-            tool_log.append({"tool": u["name"], "input": u.get("input"), "ok": not is_error,
-                             "result": result})
+            tool_log.append({"tool": u["name"], "input": args, "ok": not is_error, "result": result})
             results.append({"toolResult": {"toolUseId": u["toolUseId"],
                                            "content": [{"json": json.loads(json.dumps(result, default=str))}],
                                            "status": "error" if is_error else "success"}})
         messages.append({"role": "user", "content": results})
     else:
-        reply = "Sorry, I'm having trouble with that request. I'm passing it to operations."
-    if not reply:
-        reply = "Sorry, could you say that again?"
+        reply = ""
+        events.append({"stage": "output", "code": "TOOL_LOOP_LIMIT"})
+
+    reply, out_events = _validate_reply(con, model, system, tool_config, messages, reply, facts, tool_log)
+    events += out_events
+    if messages and messages[-1]["role"] == "assistant":
+        messages[-1] = {"role": "assistant", "content": [{"text": reply}]}
+    else:
+        messages.append({"role": "assistant", "content": [{"text": reply}]})
     now = clock.now(con)
     _store_message(con, thread_id, "AGENT", "agent", reply, now)
     transcript.append({"t": clock.hhmm(now), "from": "agent", "text": reply})
     state["messages"] = messages
     memory.save(thread_id, state)
-    return {"thread_id": thread_id, "duplicate": False, "reply": reply, "tool_calls": tool_log}
+    return {"thread_id": thread_id, "duplicate": False, "reply": reply, "tool_calls": tool_log,
+            "guardrails": events}
+
+
+def _validate_reply(con, model, system, tool_config, messages, reply, facts, tool_log):
+    """Check the reply against tool results; one repair attempt, then a template reply."""
+    events = []
+    problems = gr.check_reply(reply, facts, tool_log) if reply else ["EMPTY_REPLY"]
+    if not problems:
+        return reply, events
+    events.append({"stage": "output", "code": "REPLY_BLOCKED", "problems": problems})
+    cap.log(con, "guardrail", "check_reply", None, "BLOCKED", {"problems": problems, "reply": reply})
+    attempt = list(messages)
+    if attempt and attempt[-1]["role"] != "assistant":
+        attempt.append({"role": "assistant", "content": [{"text": reply or "(no reply)"}]})
+    attempt.append({"role": "user", "content": [{"text": gr.repair_prompt(problems)}]})
+    try:
+        resp = model.converse(system=system, messages=_trim(attempt), tool_config=tool_config)
+        fixed = "\n".join(b["text"] for b in resp["output"]["message"]["content"] if "text" in b).strip()
+    except (IndexError, KeyError):
+        fixed = ""
+    if fixed and resp.get("stopReason") != "tool_use" and not gr.check_reply(fixed, facts, tool_log):
+        events.append({"stage": "output", "code": "REPLY_REPAIRED"})
+        cap.log(con, "guardrail", "check_reply", None, "REPAIRED", {"reply": fixed})
+        return fixed, events
+    safe = gr.fallback_reply(tool_log)
+    events.append({"stage": "output", "code": "FALLBACK_REPLY"})
+    cap.log(con, "guardrail", "check_reply", None, "FALLBACK", {"reply": safe})
+    return safe, events
